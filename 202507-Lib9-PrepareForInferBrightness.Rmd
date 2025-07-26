@@ -1,0 +1,309 @@
+---
+title: "Classify and Prepare Mapped Sequences for Brightness Inference"
+author: "Andrew S Holston"
+date: '2025-07-24'
+output:
+  html_notebook:
+    theme: spacelab
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  html_document:
+    toc: yes
+    toc_depth: '5'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+---
+
+**R Notebook:** <font color="green">Provides reproducible analysis for **Classifying and Preparing Mapped Sequences for Brightness Inference** </font>
+
+**GitHub Repository:** [https://github.com/PlesaLab/HK-Flow-seq](https://github.com/PlesaLab/HK-Flow-seq)
+
+# Experiment
+
+This pipeline processes a library of histidine kinase (HK) fusion phase variants and their mutations to infer their fluorescence brightness values by sorting and sequencing (flow-seq). Brightness is inferred at the barcode level, with the brightness converted into MEFL (Molecules of Equivalent Fluorescein) for comparison between experiments, and then these values are used to determine the brightness at the protein level for each variant.
+
+```{css}
+.badCode {
+background-color: lightpink;
+font-weight: bold;
+}
+
+.goodCode {
+background-color: lightgreen;
+font-weight: bold;
+}
+
+.sharedCode {
+background-color: lightblue;
+font-weight: bold;
+}
+
+table {
+  margin: auto;
+  border-top: 1px solid #666;
+  border-bottom: 1px solid #666;
+}
+table thead th { border-bottom: 1px solid #ddd; }
+th, td { padding: 5px; }
+thead, tfoot, tr:nth-child(even) { background: #eee; }
+```
+
+```{r setup, include=FALSE}
+# Set global options for notebook
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = TRUE, message = TRUE)
+knitr::opts_chunk$set(echo = TRUE, class.source = "bg-success")
+
+# Getting the path of your current open file and set as wd
+current_path = rstudioapi::getActiveDocumentContext()$path 
+setwd(dirname(current_path))
+print(getwd())
+```
+
+# Required Packages
+The tidyverse collection of R packages and the R package Biostrings must be installed and loaded for this program to work. See the Reproducibility tab for a list of packages and versions numbers used.
+```{r}
+# The following packages are needed for the below program to run
+library(tidyverse)
+library(Biostrings)
+```
+
+```{r include=FALSE}
+# Set a seed to keep the same random number generation to make the results repeatable between systems
+set.seed(1987)
+```
+
+# Classifying and Filtering Variants
+
+## Import Mapping Information
+
+We begin by loading in the mapping file, which contains the following information for each row:
+
+* **BC:** The DNA **barcode** [`BC`] mapped to the variant in the row
+* **seq:** The DNA sequence of the variant
+* **IDfull:** The full ID of the variant, containing its UniProt ID, fusion phase, the level of degeneracy (how many fusion phase variants were designed for the parent HK chimera), and DropSynth barcode
+* **ID:** The UniProt ID of the variant (or, for mutants, the closest match)
+* **phase:** The fusion phase of the variant
+* **degen:** The number of fusion phase variants designed for the parent chimera
+* **class:** This classifies the sequence into one of three values at the DNA level: perfect, mutant_phase, or mutant_nophase. These correspond to DNA sequences perfectly corresponding to a design, sequences which are identifiable to a specific fusion phase variant, and sequences which are matched to a UniProt ID, but not to a specific fusion phase variant
+* **aa_sequence:** The **amino acid** [`AA`] sequence of the variant
+
+
+```{r}
+# Load mapping file made from combined PacBio and Nanopore sequencing data for Library 9 (Sample 1)
+  L9_MutAll_Combined <- read.csv(file ="/home/andrewh/20241206-HKmapping_all/20250108-wAA-lib4oliCodon1.map_all_S1.csv", header = TRUE, sep = ",")
+```
+
+## Filter Out Variants Below Certain Lengths
+Our preparation continues with filtering out sequences with premature stops early in the sequence. Sequences with a stop codon in, and only in, the last 35 amino acids of their sequence are noted and kept for downstream analysis of truncated variants.
+```{r}
+  L9_MutAll_Filtered <- L9_MutAll_Combined %>%
+    mutate(
+      # Note which AA sequences contain a stop codon (*)
+      ContainsStop = if_else(str_detect(aa_sequence, "\\*"), "Yes", "No"),
+      # Check for stop codon specifically within the last 35 AAs, and nowhere else in the AA sequence
+      StopInLast35 = case_when(
+        str_detect(str_sub(aa_sequence, -35), "\\*") &
+        !str_detect(str_sub(aa_sequence, 1, -36), "\\*") ~ "Yes",
+        TRUE ~ "No"
+      ),
+      # Trim sequence to directly before the first appearance of a stop codon, if present
+      aa_trimmed = if_else(str_detect(aa_sequence, "\\*"),
+                           substr(aa_sequence, 1, str_locate(aa_sequence, "\\*")[,1]),
+                           aa_sequence),
+      aa_length = nchar(as.character(aa_trimmed))
+    ) %>%
+    # The minimum length of a designed AA in this library is 205AA, so 35AA less than that is 170, so first we filter on length 170 to allow N-terminal stop truncations, but to length 200 for AA seqs with no early truncation
+    filter(
+      (ContainsStop == "No" & aa_length > 199) | (ContainsStop == "Yes" & aa_length > 169)) %>%
+    filter(ContainsStop == "No" | StopInLast35 == "Yes") %>%
+    select(-aa_sequence) %>%
+    dplyr::rename(aa_sequence = aa_trimmed)
+```
+
+## Summary Stats & Barcode Collisions (Lib9/Sample 1)
+We now look at BC collisions, that is, where two different variants map to the same DNA BC
+```{r}
+# Get count of distinct rows
+L9_MutAll_Filtered %>% distinct() %>% nrow()
+
+# Get count of rows with perfect variants
+L9_MutAll_Filtered %>% filter(class == "perfect") %>% nrow()
+
+# Count how many variants are mapped to each unique BC
+L9_BCMultiplicity <- L9_MutAll_Filtered %>%
+  group_by(BC) %>%
+  summarise(VariantCount = n())
+
+# See how many unique BCs have more than one variant mapped to them
+L9_BCMultiplicity %>% filter(VariantCount > 1) %>% nrow()
+
+# Take only the BCs which have more than one variant mapped to them, then join only the rows from the previous dataframe which have a matching BC
+L9_MultiBC_Details <- L9_BCMultiplicity %>%
+  filter(VariantCount > 1) %>%
+  inner_join(L9_MutAll_Filtered, by = "BC")
+
+# Number of perfect variants among these duplicated BCs
+L9_MultiBC_Details %>% filter(class == "perfect") %>% nrow()
+```
+
+We now subset these BCs with multiple variants into perfects and non-perfects
+```{r}
+# Isolate perfect variants for duplicated BCs
+L9_MultiBC_Perfects <- L9_MultiBC_Details %>%
+  filter(class == "perfect") %>%
+  select(BC, ID, class, VariantCount) %>%
+  distinct()
+
+# How many of these BCs match multiple perfect variants?
+L9_MultiBC_Perfects %>% nrow()
+
+# How many of the BCs which match multiple rows of perfects match exactly two variants?
+mean(L9_MultiBC_Perfects$VariantCount)
+sd(L9_MultiBC_Perfects$VariantCount)
+
+# Isolate mutant variants for duplicated BCs
+L9_MultiBC_NonPerfects <- L9_MultiBC_Details %>%
+  filter(class != "perfect") %>%
+  select(BC, ID, class) %>%
+  distinct()
+# How many of these BCs which match multiple rows contain mutants with different UniProt IDs
+L9_MultiBC_NonPerfects %>% nrow()
+
+# How many BCs are associated with both perfect and mutant variants?
+L9_MultiBC_Perfects %>%
+  inner_join(L9_MultiBC_NonPerfects, by = "BC") %>%
+  nrow()
+```
+
+No barcodes are associated with both perfect and mutant variants
+
+## Remove Barcode Collisions
+Here, we remove barcode collisions. There are no BCs which match to both perfect and non-perfect variants. We will remove all BCs which map to multiple mutant variants. However, for perfect variants, when the +1n and +1c fusion phase variants encode the same amino acid, the BC will match to both variants, but the variants will be in different rows. Thus, as all BCs matching multiple variants fall into this case, for BCs matching multiple variants we randomly remove one of the rows.
+```{r}
+# Remove the BCs which match to multiple mutant variants
+L9_Filtered_NoMutantBCCollisions <- L9_MutAll_Filtered %>% 
+  anti_join(L9_MultiBC_NonPerfects %>% select(BC) %>% distinct(), by = "BC")
+
+# For BCs which map to two rows of perfects, randomly keeps one of the perfect variants
+L9_Filtered_BCResolved <- L9_Filtered_NoMutantBCCollisions %>%
+  group_by(BC) %>%
+  slice_sample(n = 1) %>%
+  ungroup()
+
+# How many rows are present after filtering?
+L9_Filtered_BCResolved %>% nrow()
+```
+
+Now, for a check, let's see how many BCs are present before and after removing collisions.
+```{r}
+# Sanity check: quantify how many BCs dropped out
+L9_MutAll_Filtered %>% select(BC) %>% distinct() %>% nrow()
+L9_Filtered_BCResolved %>% select(BC) %>% distinct() %>% nrow()
+```
+So, we see there are 40,746 BCs fewer than prior to removing collisions
+
+## Bring in and Process Reference Designs
+Now, as we are wanting to classify our variants at the amino acid level, and they were previously classified at the DNA level, the file of designed variants for this library are brought in, so as to aid with classification purposes. The AA sequence in the reference design file contains the starting Methionine, which is trimmed for compatibility with the mapping data.
+
+```{r}
+# Read AA sequence reference designs
+Oli4C1_AA_Perfect_Designs_raw <- readAAStringSet("/home/andrewh/HKLibs-Designs_noEnvZ/Lib1c1_4oli_aa_withM_noRE_noGGover.fasta")
+
+# Split metadata into column names
+Oli4C1_AA_Perfect_Designs_df <- as.data.frame(Oli4C1_AA_Perfect_Designs_raw) %>%
+  tibble::rownames_to_column(var = "IDfull")
+colnames(Oli4C1_AA_Perfect_Designs_df) <- c("IDfull", "aa_sequence")
+
+Split_Design_Metadata <- strsplit(Oli4C1_AA_Perfect_Designs_df$IDfull, ";")
+Split_Design_Metadata_df <- as.data.frame(do.call(rbind, Split_Design_Metadata))
+colnames(Split_Design_Metadata_df) <- c("ID", "phase", "degen", "dsbc")
+
+Oli4C1_AA_Perfect_Designs <- cbind(Oli4C1_AA_Perfect_Designs_df, Split_Design_Metadata_df) %>%
+  mutate(class = "perfect", BC = "REMOVETHESEROWSAFTER",
+    # Remove starting 'M' from AA sequence for consistency
+    aa_sequence = str_sub(aa_sequence, 2, -1), 
+    degen = as.integer(as.character(degen))) %>%
+  select(-dsbc) %>% 
+  mutate(aa_length = nchar(as.character(aa_sequence)))
+
+# Clean up intermediate variables for decluttering workspace and memory saving
+rm(Oli4C1_AA_Perfect_Designs_raw, Oli4C1_AA_Perfect_Designs_df, Split_Design_Metadata, Split_Design_Metadata_df)
+```
+
+Confirm the lengths of the reference designs.
+```{r}
+# Confirm design lengths
+min(Oli4C1_AA_Perfect_Designs$aa_length)
+max(Oli4C1_AA_Perfect_Designs$aa_length)
+mean(Oli4C1_AA_Perfect_Designs$aa_length)
+median(Oli4C1_AA_Perfect_Designs$aa_length)
+sd(Oli4C1_AA_Perfect_Designs$aa_length)
+```
+
+## Combine Filtered Data with Reference Designs
+Now, we combine the data we have trimmed and filtered with our dataframe of reference designs
+
+```{r}
+# To combine the dataframes, we bind the rows together
+L9_Combined_Resolved_PerfectsBound <- bind_rows(L9_Filtered_BCResolved, Oli4C1_AA_Perfect_Designs)
+```
+
+# Classify and Annotate Library 9 Variants at the Amino Acid Level
+Now, with these dataframes combined, we can classify and annotate the library 9 variants at the AA level
+```{r}
+  L9_AllVariants_Annotated <- L9_Combined_Resolved_PerfectsBound %>%
+    group_by(ID, aa_sequence) %>%
+    mutate(
+      # Prioritize perfect class annotation if present for ID+AA combo
+      aa_class = case_when(
+        any(class == "perfect") ~ "perfect",
+        any(class == "mutant_phase") ~ "mutant_phase",
+        any(class == "mutant_nophase") ~ "mutant_nophase",
+        TRUE ~ class
+      ),
+      # Assign corresponding phase, prioritizing in same order as above
+      aa_phase = case_when(
+        aa_class == "perfect" ~ dplyr::first(phase[class == "perfect"]),
+        aa_class == "mutant_phase" ~ dplyr::first(phase[class == "mutant_phase"]),
+        aa_class %in% c("perfect", "mutant_phase") ~ dplyr::first(phase[class %in% c("perfect", "mutant_phase")]),
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    ungroup() %>% 
+    group_by(ID, phase) %>%
+    mutate(
+      has_perfect = any(aa_class == "perfect"),
+      perfect_length = if_else(has_perfect, aa_length[aa_class == "perfect"][1], NA_real_),
+      AAMut = case_when(
+        ContainsStop == "Yes" ~ "Nonsense",
+        class == "perfect" ~ "None",
+        aa_class == "perfect" & class != "perfect" ~ "DNA",
+        !has_perfect ~ "Unknown",
+        aa_class != "perfect" & aa_length == perfect_length ~ "Missense",
+        aa_class != "perfect" & aa_length > perfect_length ~ "Insertion",
+        aa_class != "perfect" & aa_length < perfect_length ~ "Deletion",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    select(-has_perfect, -perfect_length) %>%
+    ungroup() %>%
+    mutate(phase = na_if(trimws(phase), "")) %>%
+    # AA phase can also be used for this purpose, if possible
+    mutate(aa_phase = if_else(!is.na(phase), phase, aa_phase)) %>%
+    filter(BC != "REMOVETHESEROWSAFTER")
+```
+
+
+
+
+
+
+
+
+
